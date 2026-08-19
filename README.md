@@ -1,6 +1,6 @@
 # GitHub Proxy v2.3
 
-由Deekseek老师编写的
+由Deepseek老师编写的
 轻量、安全的 GitHub 反向代理，支持短链和完整 URL 两种访问方式。
 
 ## 访问格式
