@@ -1,4 +1,11 @@
+# GitHub Proxy — Apache Rewrite Rules
 RewriteEngine On
+RewriteBase /
+
+# 真实文件/目录直接访问
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
-RewriteRule ^(.*)$ index.php [L]
+# 允许 .well-known 直接访问
+RewriteCond %{REQUEST_URI} !^/\.well-known/
+# 交给 index.php
+RewriteRule ^(.*)$ index.php [L,QSA]
