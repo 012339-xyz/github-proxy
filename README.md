@@ -42,3 +42,8 @@
 - PHP 7.4+
 - cURL 扩展
 - Apache mod_rewrite 或 Nginx rewrite
+
+## 已知问题
+
+- 访问页面时，页面最上方会有未正常截断的标签
+- 可能导致页面布局失效
