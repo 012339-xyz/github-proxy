@@ -1,49 +1,50 @@
-# GitHub Proxy v2.3
+# GitHub Proxy
 
-由Deepseek老师编写的
-轻量、安全的 GitHub 反向代理，支持短链和完整 URL 两种访问方式。
+由Deepseek老师编写的一个轻量、安全的 GitHub 反向代理，支持短格式访问和完整 URL 透传。
 
-## 访问格式
+## 功能特性
 
-| 格式 | 示例 |
-|---|---|
-| 短格式 | `https://yourdomain.com/microsoft/vscode` |
-| 短格式 + 子路径 | `https://yourdomain.com/microsoft/vscode/tree/main` |
-| 完整 URL | `https://yourdomain.com/https://github.com/microsoft/vscode` |
-| Raw 文件 | `https://yourdomain.com/https://raw.githubusercontent.com/user/repo/main/file.txt` |
-| API | `https://yourdomain.com/https://api.github.com/repos/microsoft/vscode` |
+- ✅ **短格式**: `域名/user/repo` → 自动补全为 `github.com/user/repo`
+- ✅ **完整 URL**: `域名/https://github.com/...` → 原样代理
+- ✅ **流式输出**: 大文件不爆内存，边收边发
+- ✅ **MIME 正确**: Content-Type 实时透传，JS/CSS 不再报 MIME 错误
+- ✅ **安全边界切割**: 只在 `>` 标签闭合处切割，绝不截断 URL
+- ✅ **防套娃**: 已代理 URL 不会二次包装
+- ✅ **登录拦截**: 自动检测并阻止 GitHub 登录跳转
+- ✅ **前端拦截**: 注入 JS 重写 fetch / XHR / WebSocket / form
+- ✅ **二进制透传**: 图片/字体/压缩包零修改直传
 
 ## 部署
 
 ### Apache
-将 `index.php` 和 `.htaccess` 放在网站根目录。
+
+1. 上传 `index.php` 和 `.htaccess` 到网站根目录
+2. 确保 Apache 开启 `mod_rewrite`
+3. 确保 PHP 开启 cURL 扩展
 
 ### Nginx
-将 `index.php` 放在网站根目录，参考 `nginx.conf.example` 配置。
 
-### 配置项 (index.php 顶部)
-- `$AUTH_ENABLED` — 是否开启密码保护 (默认 false)
-- `$AUTH_PASSWORD` — 访问密码
-- `$ALLOWED_HOSTS` — 允许代理的目标域名白名单
+1. 上传 `index.php` 到网站根目录
+2. 参考 `nginx.conf.example` 配置
+3. **关键**: 设置 `fastcgi_buffering off;` 以启用流式输出
+4. 重载 Nginx: `nginx -s reload`
 
-## 特性
+## 使用
 
-- ✅ 流式输出 (不缓冲整个响应，支持大文件)
-- ✅ Content-Type 透传 (MIME 类型正确，JS/CSS/图片不混淆)
-- ✅ URL 重写: 属性 / CSS url() / JS 字符串 / srcset
-- ✅ 安全边界截断 (流式场景下不会破坏 HTML 标签)
-- ✅ JS 运行时重写 (fetch / XHR / WebSocket / EventSource)
-- ✅ 拦截 GitHub 登录重定向
-- ✅ 短格式 `/user/repo` 自动补全为 `github.com`
-- ✅ 相对路径 (./ ../ /path) 正确处理
+```
+https://yourdomain.com/microsoft/vscode
+https://yourdomain.com/microsoft/vscode/tree/main
+https://yourdomain.com/https://raw.githubusercontent.com/user/repo/main/file.txt
+https://yourdomain.com/https://api.github.com/repos/microsoft/vscode
+```
 
-## 要求
+## 配置
 
-- PHP 7.4+
-- cURL 扩展
-- Apache mod_rewrite 或 Nginx rewrite
+编辑 `index.php` 顶部常量:
 
-## 已知问题
+```php
+define('AUTH_ENABLED', false);   // 设为 true 开启 token 验证
+define('AUTH_TOKEN',   'changeme'); // 自定义 token
+```
 
-- 访问页面时，页面最上方会有未正常截断的标签
-- 可能导致页面布局失效
+开启后访问需加 `?token=changeme` 参数。
