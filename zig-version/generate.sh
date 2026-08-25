@@ -7,11 +7,6 @@ if [ -z $(which nginx) ]; then
         exit -1;
 fi
 
-if [ -z $(which curl) ]; then 
-        echo "Cannot find curl"
-        exit -1;
-fi
-
 if [ -z $(which zig) ]; then 
         echo "Cannot find zig"
         exit -1;
@@ -259,7 +254,7 @@ cat >> inject.js << EOF
                 } else {
                         path = url;
                 }
-                if (banned_path.includes[path]) {
+                if (banned_path.includes(path)) {
                         return true;
                 } else {
                         return false;
