@@ -1,12 +1,3 @@
-// Copyright 2026 012339-xyz
-
-// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-// THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
 const std = @import("std");
 
 const Config = struct {
@@ -20,8 +11,11 @@ const Config = struct {
     upstream: []const u8,
     port: u16,
     banned_zon: []const u8,
+    inject_js: bool,
+    inject_js_path: []const u8,
 };
 
+var inject_js: []const u8 = undefined;
 var config: Config = undefined;
 var banned_list: []const []const u8 = undefined;
 var banned_mapping: std.StringHashMap(void) = undefined;
@@ -35,7 +29,7 @@ fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !void {
     const config_file_content = try allocator.alloc(u8, config_file_length + 1);
     defer allocator.free(config_file_content);
 
-    _ = config_file.readPositionalAll(io, config_file_content, 0) catch unreachable;
+    _ = try config_file.readPositionalAll(io, config_file_content, 0);
     config_file_content[config_file_length] = 0;
 
     config = try std.zon.parse.fromSliceAlloc(Config, allocator, config_file_content[0..config_file_length :0], null, .{});
@@ -49,7 +43,7 @@ fn loadBannedList(allocator: std.mem.Allocator, io: std.Io) !void {
     const banned_list_file_content = try allocator.alloc(u8, banned_list_file_length + 1);
     defer allocator.free(banned_list_file_content);
 
-    _ = banned_list_file.readPositionalAll(io, banned_list_file_content, 0) catch unreachable;
+    _ = try banned_list_file.readPositionalAll(io, banned_list_file_content, 0);
     banned_list_file_content[banned_list_file_length] = 0;
 
     banned_list = try std.zon.parse.fromSliceAlloc([]const []const u8, allocator, banned_list_file_content[0..banned_list_file_length :0], null, .{});
@@ -151,13 +145,26 @@ fn handleClientStream(io: std.Io, _allocator: std.mem.Allocator, client_stream: 
         });
         defer client_response_body.end() catch {};
 
+        const can_inject = if (std.mem.startsWith(u8, upstream_response.head.content_type orelse "", "text/html")) true else false;
         const upstream_reader = upstream_response.reader(&upstream_recv_buf);
-
+        var injected: bool = false;
         while (true) {
             var buf: [1024 * 4]u8 = undefined;
             const upstream_reader_length = try upstream_reader.readSliceShort(&buf);
 
             var index: usize = 0;
+
+            if ((!injected) and config.inject_js and can_inject) {
+                if (std.mem.findPos(u8, &buf, index, "<head>")) |found| {
+                    _ = try client_response_body.writer.write(buf[index..found]);
+                    _ = try client_response_body.writer.write("<head><script>");
+                    _ = try client_response_body.writer.write(inject_js);
+                    _ = try client_response_body.writer.write("</script>");
+                    index = found + 6;
+                }
+                injected = true;
+            }
+
             while (std.mem.findPos(u8, &buf, index, "https://")) |found| {
                 if (try writeIfFound(&client_response_body.writer, &buf, index, found, "https://github.githubassets.com", config.assets)) |new| {
                     index = new;
@@ -230,6 +237,19 @@ pub fn main(init: std.process.Init) !u8 {
     banned_mapping = .init(init.gpa);
     defer banned_mapping.deinit();
 
+    if (config.inject_js) {
+        const inject_js_file = try std.Io.Dir.cwd().openFile(init.io, config.inject_js_path, .{});
+        defer inject_js_file.close(init.io);
+
+        const inject_js_file_length = try inject_js_file.length(init.io);
+        const inject_js_file_content = try init.gpa.alloc(u8, inject_js_file_length);
+
+        _ = try inject_js_file.readPositionalAll(init.io, inject_js_file_content, 0);
+        inject_js = inject_js_file_content;
+    }
+    defer if (config.inject_js) {
+        defer init.gpa.free(inject_js);
+    };
     upstream = .{
         .allocator = init.gpa,
         .io = init.io,

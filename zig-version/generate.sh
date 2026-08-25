@@ -204,20 +204,155 @@ EOF
 cat >> config.zon << EOF
 .{
     // https://yourdomain.com
-    .main = "$main_domain",
-    .assets = "$assets_domain",
-    .raw = "$raw_domain",
-    .objects = "$objects_domain",
-    .avatars = "$avatars_domain",
-    .gist = "$gist_domain",
-    .user_images = "$user_images_domain",
+    .main = "https://$main_domain",
+    .assets = "https://$assets_domain",
+    .raw = "https://$raw_domain",
+    .objects = "https://$objects_domain",
+    .avatars = "https://$avatars_domain",
+    .gist = "https://$gist_domain",
+    .user_images = "https://$user_images_domain",
     .banned_zon = "./banned.zon",
 
     // Proxy https://github.com
     // Format http://127.0.0.1:port
     .upstream = "http://127.0.0.1:$upstream_port",
     .port = $listen_port,
+    .inject_js = true,
+    .inject_js_path = "./inject.js",
 }
+EOF
+
+cat >> inject.js << EOF
+(function () {
+        let mapping = {
+                "github.com": "$main_domain",
+                "raw.githubusercontent.com": "$raw_domain",
+                "github.githubassets.com": "$assets_domain",
+                "objects.githubusercontent.com": "$objects_domain",
+                "avatars.githubusercontent.com": "$avatars_domain",
+                "gist.github.com": "$gist_domain",
+                "user-images.githubusercontent.com": "$user_images_domain",
+        };
+        let banned_path = [
+                // Format: /login
+                "/",
+                "/login",
+                "/signup",
+                "/oauth",
+                "/sso",
+                "/authorize",
+                "/authenticate",
+                "/join",
+                "/copilot",
+                "/enterprise",
+                "/pricing",
+                "/plan",
+                "/account",
+                "/settings/profile",
+                "/settings/billing",
+        ];
+        function isBanned(url) {
+                let parsed_url = URL.parse(url);
+                var path = null;
+                if (parsed_url != null) {
+                        path = parsed_url.pathname;
+                } else {
+                        path = url;
+                }
+                if (banned_path.includes[path]) {
+                        return true;
+                } else {
+                        return false;
+                }
+        }
+        function toMapped(url) {
+                let parsed_url = URL.parse(url);
+                var host = null;
+                if (parsed_url != null) {
+                        host = parsed_url.host;
+                }
+                if (host != null) {
+                        if (mapping[host] != null) {
+                                parsed_url.hash = mapping[host];
+                        }
+                        return parsed_url.toString();
+                } else {
+                        return url;
+                }
+        }
+        document.addEventListener("DOMContentLoaded", function () {
+                let hrefs = document.querySelectorAll("a[href]");
+                for (i = 0; i < hrefs.length; i++) {
+                        let href = hrefs[i].getAttribute("href");
+                        if (!href) {
+                                continue;
+                        }
+                        if (isBanned(href)) {
+                                hrefs[i].setAttribute("href", "about:blank");
+                                hrefs[i].setAttribute("onclick", "return false");
+                                hrefs[i].computedStyleMap.opacity = "0.4";
+                                hrefs[i].computedStyleMap.pointerEvents = "none";
+                        } else {
+                                hrefs[i].setAttribute("href", toMapped(href));
+                        }
+                        let actions = document.querySelectorAll("form[action]");
+                        for (i = 0; i < actions.length; i++) {
+                                let action = actions[i].getAttribute("action");
+                                if (action && isBanned(action)) {
+                                        action[i].setAttribute("action", "about:blank");
+                                }
+                        }
+                }
+                let wfetch = window.fetch;
+                if (wfetch) {
+                        window.fetch = function (wrequest, args) {
+                                if (typeof (wrequest) == "string") {
+                                        if (isBanned(wrequest)) {
+                                                wrequest = "about:blank";
+                                        }
+                                        wrequest = toMapped(wrequest);
+                                } else if (wrequest && path.url) {
+                                        if (isBanned(wrequest.url)) {
+                                                wrequest.url = "about:blank";
+                                        }
+                                        wrequest.url = toMapped(wrequest.url);
+                                }
+                                return wfetch.call(this, wrequest, args);
+                        }
+                }
+
+                let xopen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function (method, url, a, b, c) {
+                        if (isBanned(url)) {
+                                url = "about:blank";
+                        }
+                        url = toMapped(url);
+                        return xopen.call(this, method, url, a, b, c);
+                }
+                let wsocket = window.WebSocket;
+                if (wsocket) {
+                        window.WebSocket = function (url, protocol) {
+                                if (isBanned(url)) {
+                                        url = "about:blank";
+                                }
+                                return new wsocket(toMapped(url), protocol);
+                        }
+                }
+                document.addEventListener("submit", function (event) {
+                        let target = event.target;
+                        if (target && target.action && isBanned(target.action)) {
+                                event.preventDefault();
+                                return false;
+                        }
+                }, true);
+                window.addEventListener("beforeunload", function (event) {
+                        if (isBanned(this.location.href)) {
+                                event.preventDefault();
+                                return false;
+                        }
+                })
+        });
+})();
 EOF
 
 cat >> banned.zon << EOF 
