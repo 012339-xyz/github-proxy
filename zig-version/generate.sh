@@ -268,7 +268,7 @@ cat >> inject.js << EOF
                 }
                 if (host != null) {
                         if (mapping[host] != null) {
-                                parsed_url.hash = mapping[host];
+                                parsed_url.host = mapping[host];
                         }
                         return parsed_url.toString();
                 } else {
