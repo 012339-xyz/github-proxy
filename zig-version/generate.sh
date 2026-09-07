@@ -50,7 +50,7 @@ server {
 		proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
 		proxy_buffering on;
 		proxy_set_header Accept-Encoding "";
-		add_header content-security-policy "default-src 'none'; base-uri 'self'; child-src $main_domain $assets_domain; connect-src $main_domain $raw_domain $gist_domain $assets_domain $objects_domain github-cloud.s3.amazonaws.com; img-src $main_domain $avatars_domain $assets_domain; script-src $assets_domain; style-src 'unsafe-inline' $assets_domain; upgrade-insecure-requests";
+		add_header content-security-policy "default-src 'none'; base-uri 'self'; child-src $main_domain $assets_domain; connect-src $main_domain $raw_domain $gist_domain $assets_domain $objects_domain github-cloud.s3.amazonaws.com; img-src $main_domain $avatars_domain $assets_domain; script-src 'unsafe-inline' $assets_domain; style-src 'unsafe-inline' $assets_domain; upgrade-insecure-requests";
 	}
 
         	location = / {
@@ -347,6 +347,9 @@ cat >> inject.js << EOF
                         }
                 })
         });
+		self.setInterval(function() {
+                document.getElementsByClassName("session-authentication")[0].remove();
+        }, 1000);
 })();
 EOF
 
