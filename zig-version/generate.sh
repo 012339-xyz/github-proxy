@@ -13,9 +13,6 @@ if [ -z $(which zig) ]; then
 fi
 
 read -p "main domain: " main_domain;
-read -p "listen port: " listen_port;
-read -p "upstream port: (9002)" upstream_port
-upstream_port="${upstream_port:-9002}";
 read -p "assets domain: (assets.$main_domain)" assets_domain
 assets_domain="${assets_domain:-assets.$main_domain}";
 read -p "raw domain: (raw.$main_domain)" raw_domain
@@ -42,7 +39,7 @@ server {
 	ssl_certificate please/replace/me.pem;
 	ssl_certificate_key please/replace/me.key;
 	location / {
-		proxy_pass http://127.0.0.1:$listen_port/;
+		proxy_pass http://127.0.0.1:9001;
 		proxy_cache proxy_cache;
 		proxy_cache_key \$uri\$is_args\$args;
 		proxy_cache_valid 200 302 2m;
@@ -50,10 +47,10 @@ server {
 		proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
 		proxy_buffering on;
 		proxy_set_header Accept-Encoding "";
-		add_header content-security-policy "default-src 'none'; base-uri 'self'; child-src $main_domain $assets_domain; connect-src $main_domain $raw_domain $gist_domain $assets_domain $objects_domain github-cloud.s3.amazonaws.com; img-src $main_domain $avatars_domain $assets_domain; script-src 'unsafe-inline' $assets_domain; style-src 'unsafe-inline' $assets_domain; upgrade-insecure-requests";
+		add_header content-security-policy "default-src 'none'; base-uri 'self'; child-src $main_domain $assets_domain; connect-src $main_domain $raw_domain $gist_domain $assets_domain $objects_domain github-cloud.s3.amazonaws.com; img-src $main_domain $avatars_domain $assets_domain; script-src 'unsafe-inline' $main_domain $assets_domain; style-src 'unsafe-inline' $assets_domain; upgrade-insecure-requests";
 	}
 
-        	location = / {
+    location = / {
 		return 200;
 	}
 	location /login {
@@ -101,7 +98,7 @@ server {
 }
 
 server {
-	listen 127.0.0.1:$upstream_port;
+	listen 127.0.0.1:9002;
 	location / {
 		proxy_pass https://github.com/;
 		proxy_cache proxy_cache;
@@ -210,8 +207,8 @@ cat >> config.zon << EOF
 
     // Proxy https://github.com
     // Format http://127.0.0.1:port
-    .upstream = "http://127.0.0.1:$upstream_port",
-    .port = $listen_port,
+    .upstream = "http://127.0.0.1:9002",
+    .port = 9001,
     .inject_js = true,
     .inject_js_path = "./inject.js",
 }
