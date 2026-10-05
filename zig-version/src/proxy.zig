@@ -20,32 +20,50 @@ var inject_js: []const u8 = undefined;
 var config: Config = undefined;
 var banned_list: []const []const u8 = undefined;
 
-fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !void {
+fn loadConfig(scratch: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io) !void {
     const config_file = try std.Io.Dir.cwd().openFile(io, "config.zon", .{});
     defer config_file.close(io);
 
     const config_file_length = try config_file.length(io);
-    const config_file_content = try allocator.alloc(u8, config_file_length + 1);
-    defer allocator.free(config_file_content);
+    const config_file_content = try scratch.alloc(u8, config_file_length + 1);
+    defer scratch.free(config_file_content);
 
     _ = try config_file.readPositionalAll(io, config_file_content, 0);
     config_file_content[config_file_length] = 0;
 
-    config = try std.zon.parse.fromSliceAlloc(Config, allocator, config_file_content[0..config_file_length :0], null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    config = std.zon.parse.fromSlice(Config, .{
+        .gpa = scratch,
+        .arena = arena,
+        .source = config_file_content[0..config_file_length :0],
+        .diagnostics = &diagnostics,
+    }) catch |err| {
+        if (err == error.ParseZon) diagnostics.log("config.zon");
+        return err;
+    };
 }
 
-fn loadBannedList(allocator: std.mem.Allocator, io: std.Io) !void {
+fn loadBannedList(scratch: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io) !void {
     const banned_list_file = try std.Io.Dir.cwd().openFile(io, config.banned_zon, .{});
     defer banned_list_file.close(io);
 
     const banned_list_file_length = try banned_list_file.length(io);
-    const banned_list_file_content = try allocator.alloc(u8, banned_list_file_length + 1);
-    defer allocator.free(banned_list_file_content);
+    const banned_list_file_content = try scratch.alloc(u8, banned_list_file_length + 1);
+    defer scratch.free(banned_list_file_content);
 
     _ = try banned_list_file.readPositionalAll(io, banned_list_file_content, 0);
     banned_list_file_content[banned_list_file_length] = 0;
 
-    banned_list = try std.zon.parse.fromSliceAlloc([]const []const u8, allocator, banned_list_file_content[0..banned_list_file_length :0], null, .{});
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    banned_list = std.zon.parse.fromSlice([]const []const u8, .{
+        .gpa = scratch,
+        .arena = arena,
+        .source = banned_list_file_content[0..banned_list_file_length :0],
+        .diagnostics = &diagnostics,
+    }) catch |err| {
+        if (err == error.ParseZon) diagnostics.log(config.banned_zon);
+        return err;
+    };
 }
 
 fn hasPrefixCI(s: []const u8, prefix: []const u8) bool {
@@ -106,6 +124,7 @@ fn isBannedPath(raw_path: []const u8) bool {
     }
     return false;
 }
+
 const HostMap = struct { host: []const u8, base: []const u8 };
 
 fn hostMaps(buf: *[10]HostMap) []const HostMap {
@@ -681,10 +700,11 @@ fn worker(init: std.process.Init, server: *std.Io.net.Server, sem: *std.Io.Semap
 }
 
 pub fn main(init: std.process.Init) !u8 {
-    try loadConfig(init.gpa, init.io);
-    defer std.zon.parse.free(init.gpa, config);
-    try loadBannedList(init.gpa, init.io);
-    defer std.zon.parse.free(init.gpa, banned_list);
+    var zon_arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer _ = zon_arena.deinit();
+
+    try loadConfig(init.gpa, zon_arena.allocator(), init.io);
+    try loadBannedList(init.gpa, zon_arena.allocator(), init.io);
 
     if (config.inject_js) {
         const inject_js_file = try std.Io.Dir.cwd().openFile(init.io, config.inject_js_path, .{});
