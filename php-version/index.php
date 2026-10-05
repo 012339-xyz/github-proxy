@@ -1,34 +1,14 @@
-<?php
-/**
- * GitHub Proxy — v2.5 (Stable) — with signin/signup/copilot blocking
- *
- * 用法:
- *   /user/repo              → https://github.com/user/repo
- *   /user/repo/tree/main    → https://github.com/user/repo/tree/main
- *   /https://github.com/... → 完整 URL 透传
- *
- * 架构:
- *   - 全局变量 $gBuf 累积文本块
- *   - 每次收到数据，找最后一个 '>' 安全切割
- *   - 头部由 CURLOPT_HEADERFUNCTION 逐行转发
- *   - 主体由 CURLOPT_WRITEFUNCTION 逐块重写+输出
- *   - curl_exec 返回后，flush 剩余 buffer
- */
-
-define('PROXY_VERSION', '2.5');
+define('PROXY_VERSION', '2.6');
 define('AUTH_ENABLED', false);
 define('AUTH_TOKEN',   'changeme');
 
-/* ═════════════════════════════════════════════
- * 阻止列表 — 禁止代理访问的路径关键字
- * 命中以下关键字的 URL 将被直接拦截拒绝
- * ═════════════════════════════════════════════ */
+define('PROXY_BASE', '');
+
 define('BLOCK_ENABLED', true);
-define('BLOCK_REDIRECTS', true); // 是否拦截 GitHub 发起的登录/注册重定向
+define('BLOCK_REDIRECTS', true);
 
 function getBlockKeywords(): array {
     return [
-        // 登录相关
         '/login',
         '/signin',
         '/session',
@@ -36,16 +16,13 @@ function getBlockKeywords(): array {
         '/authorize',
         '/oauth',
         '/sso',
-        // 注册相关
         '/signup',
         '/join',
         '/register',
-        // Copilot 相关
         '/copilot',
         '/features/copilot',
         'copilot-chat',
         'copilot-cloud',
-        // 账户/付费相关
         '/pricing',
         '/plans',
         '/checkout',
@@ -76,20 +53,32 @@ function getBlockHostKeywords(): array {
     ];
 }
 
-/* ═════════════════════════════════════════════
- * 全局状态（WRITEFUNCTION 闭包需要）
- * ═════════════════════════════════════════════ */
-$GLOBALS['gBuf']         = '';
-$GLOBALS['gContentType'] = '';
-$GLOBALS['gIsBinary']    = false;
-$GLOBALS['gHeadersSent'] = false;
-$GLOBALS['gProxyBase']   = '';
+function getBlockSegments(): array {
+    return [
+        'login', 'signin', 'signup', 'join', 'register',
+        'session', 'authenticate', 'authorize', 'oauth', 'sso',
+        'copilot', 'pricing', 'plans', 'checkout', 'billing',
+    ];
+}
 
-/* ═════════════════════════════════════════════
- * 工具函数
- * ═════════════════════════════════════════════ */
+function getBlockCompoundSegments(): array {
+    return ['copilot'];
+}
+
+
+$GLOBALS['gBuf']          = '';
+$GLOBALS['gContentType']  = '';
+$GLOBALS['gIsBinary']     = false;
+$GLOBALS['gHeadersSent']  = false;
+$GLOBALS['gProxyBase']    = '';
+$GLOBALS['gInjected']     = false;   
+$GLOBALS['gUpstreamCL']   = '';      
+$GLOBALS['gMethod']       = 'GET';
+$GLOBALS['gBlockedLoc']   = '';      
+$GLOBALS['gReqOrigin']    = '';      
 
 function getProxyBase(): string {
+    if (defined('PROXY_BASE') && PROXY_BASE !== '') return rtrim(PROXY_BASE, '/');
     $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
     $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return $scheme . '://' . $host;
@@ -108,27 +97,38 @@ function isBinaryCT(string $ct): bool {
     return false;
 }
 
-/* ═════════════════════════════════════════════
- * 白名单 & URL 判定
- * ═════════════════════════════════════════════ */
-
 function rewriteHosts(): array {
-    return [
+    static $cache = null;
+    if ($cache !== null) return $cache;
+
+    $cache = [
         'github.com', 'www.github.com',
         'raw.githubusercontent.com', 'gist.githubusercontent.com',
+        'gist.github.com',
         'api.github.com', 'github.githubassets.com',
         'avatars.githubusercontent.com',
         'avatars0.githubusercontent.com', 'avatars1.githubusercontent.com',
         'avatars2.githubusercontent.com', 'avatars3.githubusercontent.com',
         'camo.githubusercontent.com', 'user-images.githubusercontent.com',
         'objects.githubusercontent.com', 'desktop.githubusercontent.com',
-        'media.githubusercontent.com', 'assets-cdn.github.com',
+        'media.githubusercontent.com', 'private-user-images.githubusercontent.com',
+        'assets-cdn.github.com',
         'github-cloud.s3.amazonaws.com',
     ];
+
+    $extra = (string)getenv('GHPROXY_EXTRA_HOSTS');
+    if ($extra !== '') {
+        foreach (explode(',', $extra) as $h) {
+            $h = strtolower(trim($h));
+            if ($h !== '' && !in_array($h, $cache, true)) $cache[] = $h;
+        }
+    }
+    return $cache;
 }
 
 function hostInWhitelist(string $host): bool {
-    if (!$host) return false;
+    $host = strtolower($host);
+    if ($host === '') return false;
     foreach (rewriteHosts() as $h) {
         if ($host === $h || substr($host, -strlen('.' . $h)) === '.' . $h) return true;
     }
@@ -140,14 +140,23 @@ function shouldRewrite(string $url): bool {
     return hostInWhitelist(parse_url($url, PHP_URL_HOST) ?: '');
 }
 
+function isWhitelistedUrl(string $url): bool {
+    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
+    $scheme = strtolower((string)parse_url($url, PHP_URL_SCHEME));
+    if ($scheme !== 'http' && $scheme !== 'https') return false;
+    $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+    if ($host === '') return false;
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        return in_array($host, rewriteHosts(), true);
+    }
+    return hostInWhitelist($host);
+}
+
 function makeProxyUrl(string $url, string $base): string {
     if (strpos($url, $base) === 0) return $url;
     return $base . '/' . $url;
 }
 
-/* ═════════════════════════════════════════════
- * URL 阻止检查 — 拦截 signin/signup/copilot
- * ═════════════════════════════════════════════ */
 
 function isBlockedUrl(string $url): bool {
     if (!BLOCK_ENABLED) return false;
@@ -155,31 +164,23 @@ function isBlockedUrl(string $url): bool {
 
     $lower = strtolower($url);
 
-    // 1) 主机+路径关键字匹配（词边界：后面必须跟 / ? # 或结尾）
     foreach (getBlockHostKeywords() as $kw) {
-        if (preg_match('#' . preg_quote($kw, '#') . '(?=[/?#]|$)#', $lower)) return true;
+        if (preg_match('~' . preg_quote($kw, '~') . '(?=[/?#]|$)~', $lower)) return true;
     }
 
-    // 2) 路径段匹配（处理短链格式 /user/repo/login 等）
     $path = parse_url($lower, PHP_URL_PATH) ?: '';
     if ($path !== '') {
-        // 精确路径段匹配
-        $segments = explode('/', trim($path, '/'));
-        $blockSegs = ['login', 'signin', 'signup', 'join', 'register',
-                      'session', 'authenticate', 'authorize', 'oauth',
-                      'copilot', 'pricing', 'plans', 'checkout', 'billing'];
-        // 仅对已知复合词做子串匹配（避免误伤 login.py 等合法路径）
-        $compoundSegs = ['copilot'];
+        $segments    = explode('/', trim($path, '/'));
+        $blockSegs   = getBlockSegments();
+        $compoundSegs = getBlockCompoundSegments();
         foreach ($segments as $seg) {
-            if (in_array(strtolower($seg), $blockSegs, true)) return true;
-            // 仅对特定前缀做子串匹配（捕获 copilot-chat, copilot-cloud 等）
+            if (in_array($seg, $blockSegs, true)) return true;
             foreach ($compoundSegs as $cs) {
                 if (strpos($seg, $cs . '-') === 0 || strpos($seg, $cs . '_') === 0) return true;
             }
         }
     }
 
-    // 3) 查询参数中包含 login/signup 提示
     $query = parse_url($lower, PHP_URL_QUERY) ?: '';
     if ($query !== '') {
         if (preg_match('/(?:^|&)(?:return_to|redirect|next|target)=[^&]*\/(?:login|signin|signup|join)/i', $query)) {
@@ -220,15 +221,10 @@ a:hover{text-decoration:underline}
 HTML;
 }
 
-/* ═════════════════════════════════════════════
- * URL 重写 — HTML/通用
- * ═════════════════════════════════════════════ */
-
 function rewriteHtmlUrls(string $html, string $proxyBase): string {
     $hosts  = rewriteHosts();
     $alt    = implode('|', array_map('preg_quote', $hosts));
-    // 负向后顾: 前面不能是 : / 字母数字(避免双重代理)
-    $pat    = '#(?<![:/a-zA-Z0-9])(https?://)(' . $alt . ')(/[^"\'\s<>\\)]*)#';
+    $pat    = '~(?<![:/a-zA-Z0-9])(https?://)(' . $alt . ')(:\d{1,5})?(/[^"\'\s<>\\)]*)?(?=["\'\s<>():,?#]|$)~';
 
     if (!preg_match_all($pat, $html, $matches, PREG_OFFSET_CAPTURE)) return $html;
 
@@ -236,14 +232,17 @@ function rewriteHtmlUrls(string $html, string $proxyBase): string {
     foreach ($matches[0] as $i => $m) {
         $text   = $m[0];
         $off    = $m[1];
+        if ($off < 0) continue;
         $proto  = $matches[1][$i][0];
         $host   = $matches[2][$i][0];
-        $path   = $matches[3][$i][0] ?? '';
-        $orig   = $proto . $host . $path;
+        $port   = $matches[3][$i][0] ?? '';
+        $path   = $matches[4][$i][0] ?? '';
+        $orig   = $proto . $host . $port . $path;
+        if (!shouldRewrite($orig)) continue;
         $reps[] = ['s' => $off, 'e' => $off + strlen($text), 'r' => makeProxyUrl($orig, $proxyBase)];
     }
+    if (!$reps) return $html;
 
-    // 从后往前，去重叠
     usort($reps, fn($a, $b) => $b['s'] - $a['s']);
     $out = $html; $lastEnd = PHP_INT_MAX;
     foreach ($reps as $r) {
@@ -252,9 +251,6 @@ function rewriteHtmlUrls(string $html, string $proxyBase): string {
     return $out;
 }
 
-/* ═════════════════════════════════════════════
- * URL 重写 — CSS url()
- * ═════════════════════════════════════════════ */
 
 function rewriteCssUrls(string $css, string $proxyBase): string {
     return preg_replace_callback('#url\(\s*["\']?(https?://[^"\'\s)]+)["\']?\s*\)#i',
@@ -263,128 +259,103 @@ function rewriteCssUrls(string $css, string $proxyBase): string {
         }, $css);
 }
 
-/* ═════════════════════════════════════════════
- * URL 重写 — JS 字符串（保守）
- * ═════════════════════════════════════════════ */
-
 function rewriteJsUrls(string $js, string $proxyBase): string {
     $hosts = rewriteHosts();
     $alt   = implode('|', array_map('preg_quote', $hosts));
-    $pat   = '#(["\'])(https?://(' . $alt . ')/[^"\']{0,2000})\1#';
+    $pat   = '#(["\'])(https?://(' . $alt . ')(:\d{1,5})?/[^"\']{0,2000})\1#';
     return preg_replace_callback($pat, function($m) use ($proxyBase) {
         return $m[1] . makeProxyUrl($m[2], $proxyBase) . $m[1];
     }, $js);
 }
 
-/* ═════════════════════════════════════════════
- * 安全 Buffer 处理
- * ═════════════════════════════════════════════ */
+function contentMode(string $ct): string {
+    $ct = strtolower($ct);
+    if (strpos($ct, 'text/html') !== false || strpos($ct, 'application/xhtml+xml') !== false) return 'html';
+    if (strpos($ct, 'text/css') !== false) return 'css';
+    if (strpos($ct, 'javascript') !== false || strpos($ct, 'json') !== false) return 'js';
+    return 'none';
+}
+
+function applyRewrite(string $chunk, string $mode, string $proxyBase): string {
+    switch ($mode) {
+        case 'css':
+            $chunk = rewriteCssUrls($chunk, $proxyBase);
+            return rewriteHtmlUrls($chunk, $proxyBase);
+        case 'js':
+            return rewriteJsUrls($chunk, $proxyBase);
+        case 'html':
+            $chunk = rewriteHtmlUrls($chunk, $proxyBase);
+            $chunk = stripBlockedLinks($chunk);
+            return $chunk;
+        default:
+            return $chunk;
+    }
+}
 
 function flushSafeChunk(string $ct, string $proxyBase): void {
     $buf = &$GLOBALS['gBuf'];
     if ($buf === '') return;
 
+    $mode = contentMode($ct);
+
+    if ($mode === 'html') $buf = injectIntoStream($buf, $proxyBase, false);
+
     $bufLen = strlen($buf);
     $lastGt = strrpos($buf, '>');
 
-    // 有安全边界 → 切割输出
     if ($lastGt !== false && $lastGt >= 10) {
         $chunk = substr($buf, 0, $lastGt + 1);
         $buf   = substr($buf, $lastGt + 1);
-    }
-    // 无 > 但 buffer 太大(>16KB) → 强制输出
-    else if ($bufLen > 16384) {
-        $chunk = $buf;
-        $buf   = '';
-    }
-    // buffer 太小且没安全边界 → 攒着
-    else {
+    } elseif ($bufLen > 16384) {
+        $cut = false;
+        foreach (["\n", "\r", "\t", ' '] as $ws) {
+            $p = strrpos($buf, $ws);
+            if ($p !== false && ($cut === false || $p > $cut)) $cut = $p;
+        }
+        if ($cut !== false && $cut >= 1024) {
+            $chunk = substr($buf, 0, $cut + 1);
+            $buf   = substr($buf, $cut + 1);
+        } elseif ($bufLen > 65536) {
+            $chunk = $buf;
+            $buf   = '';
+        } else {
+            return;
+        }
+    } else {
         return;
     }
 
-    $lower = strtolower($ct);
-    if (strpos($lower, 'text/css') !== false) {
-        $chunk = rewriteCssUrls($chunk, $proxyBase);
-        $chunk = rewriteHtmlUrls($chunk, $proxyBase);
-    } elseif (strpos($lower, 'javascript') !== false || strpos($lower, 'json') !== false) {
-        $chunk = rewriteJsUrls($chunk, $proxyBase);
-    } else {
-        $chunk = rewriteHtmlUrls($chunk, $proxyBase);
-    }
-
-    echo $chunk;
+    echo applyRewrite($chunk, $mode, $proxyBase);
     flush();
 }
 
 function flushAllRemaining(string $ct, string $proxyBase): void {
     $buf = &$GLOBALS['gBuf'];
-    if ($buf === '') return;
+    $mode = contentMode($ct);
 
-    $lower = strtolower($ct);
-    if (strpos($lower, 'text/css') !== false) {
-        $buf = rewriteCssUrls($buf, $proxyBase);
-        $buf = rewriteHtmlUrls($buf, $proxyBase);
-    } elseif (strpos($lower, 'javascript') !== false || strpos($lower, 'json') !== false) {
-        $buf = rewriteJsUrls($buf, $proxyBase);
-    } else {
-        $buf = rewriteHtmlUrls($buf, $proxyBase);
-        if (strpos($lower, 'text/html') !== false) {
-            // ★ 服务端 HTML 过滤：移除/禁用登录注册 Copilot 链接
-            $buf = stripBlockedLinks($buf);
-            $buf = injectProxyJs($buf, $proxyBase);
-        }
+    if ($buf !== '') {
+        if ($mode === 'html') $buf = injectIntoStream($buf, $proxyBase, true);
+        $out = applyRewrite($buf, $mode, $proxyBase);
+        $buf = '';
+        echo $out;
+        flush();
     }
-
-    echo $buf;
-    flush();
-    $buf = '';
 }
-
-/* ═════════════════════════════════════════════
- * HTML 过滤 — 移除/禁用登录注册 Copilot 链接
- * ═════════════════════════════════════════════ */
 
 function stripBlockedLinks(string $html): string {
     if (!BLOCK_ENABLED) return $html;
 
-    $blockSegs = ['login', 'signin', 'signup', 'join', 'register',
-                  'copilot', 'pricing', 'plans', 'checkout', 'billing'];
-
-    // 1) 处理 a[href] 标签
     $html = preg_replace_callback(
         '#<a\b([^>]*)\bhref\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))([^>]*)>#i',
-        function ($m) use ($blockSegs) {
+        function ($m) {
             $before = $m[1];
             $href   = $m[3] ?? $m[4] ?? $m[5] ?? '';
             $after  = $m[6] ?? '';
             $full   = $m[0];
 
-            $lowerHref = strtolower($href);
-            if ($lowerHref === '' || $lowerHref === '#' || $lowerHref === 'about:blank') {
-                return $full;
-            }
+            if ($href === '' || $href === '#' || $href === 'about:blank') return $full;
 
-            // 检查是否命中阻止列表
-            $hit = false;
-            // 检查完整 host+path 关键字
-            foreach (getBlockHostKeywords() as $kw) {
-                if (strpos($lowerHref, $kw) !== false) { $hit = true; break; }
-            }
-            // 检查路径段
-            if (!$hit) {
-                $path = parse_url($lowerHref, PHP_URL_PATH) ?: $lowerHref;
-                $segs = explode('/', trim($path, '/'));
-                $compoundSegs = ['copilot'];
-                foreach ($segs as $seg) {
-                    if (in_array(strtolower($seg), $blockSegs, true)) { $hit = true; break; }
-                    foreach ($compoundSegs as $cs) {
-                        if (strpos($seg, $cs . '-') === 0 || strpos($seg, $cs . '_') === 0) { $hit = true; break 2; }
-                    }
-                }
-            }
-
-            if ($hit) {
-                // 替换为 about:blank 并禁用点击
+            if (isBlockedUrl($href)) {
                 return '<a' . $before . ' href="about:blank"' . $after
                      . ' onclick="return false;" style="opacity:0.4;pointer-events:none;"' . '>';
             }
@@ -393,35 +364,17 @@ function stripBlockedLinks(string $html): string {
         $html
     );
 
-    // 2) 处理 form[action] 标签
     $html = preg_replace_callback(
         '#<form\b([^>]*)\baction\s*=\s*("([^"]*)"|\'([^\']*)\'|([^\s>]+))([^>]*)>#i',
-        function ($m) use ($blockSegs) {
+        function ($m) {
             $before = $m[1];
             $action = $m[3] ?? $m[4] ?? $m[5] ?? '';
             $after  = $m[6] ?? '';
             $full   = $m[0];
 
-            $lowerAction = strtolower($action);
-            if ($lowerAction === '') return $full;
+            if ($action === '') return $full;
 
-            $hit = false;
-            foreach (getBlockHostKeywords() as $kw) {
-                if (strpos($lowerAction, $kw) !== false) { $hit = true; break; }
-            }
-            if (!$hit) {
-                $path = parse_url($lowerAction, PHP_URL_PATH) ?: $lowerAction;
-                $segs = explode('/', trim($path, '/'));
-                $compoundSegs = ['copilot'];
-                foreach ($segs as $seg) {
-                    if (in_array(strtolower($seg), $blockSegs, true)) { $hit = true; break; }
-                    foreach ($compoundSegs as $cs) {
-                        if (strpos($seg, $cs . '-') === 0 || strpos($seg, $cs . '_') === 0) { $hit = true; break 2; }
-                    }
-                }
-            }
-
-            if ($hit) {
+            if (isBlockedUrl($action)) {
                 return '<form' . $before . ' action="about:blank"' . $after
                      . ' onsubmit="return false;"' . '>';
             }
@@ -433,69 +386,145 @@ function stripBlockedLinks(string $html): string {
     return $html;
 }
 
-/* ═════════════════════════════════════════════
- * JS 注入 — 拦截前端动态请求
- * ═════════════════════════════════════════════ */
-
-function injectProxyJs(string $html, string $proxyBase): string {
-    $hosts        = rewriteHosts();
-    $hostsJson   = json_encode($hosts);
+function getInjectScript(string $proxyBase): string {
+    $hostsJson   = json_encode(array_values(rewriteHosts()));
     $proxyBaseJs = json_encode($proxyBase);
+    $segsJson    = json_encode(array_values(getBlockSegments()));
+    $compJson    = json_encode(array_values(getBlockCompoundSegments()));
+    $blockHostKw = json_encode(array_values(getBlockHostKeywords()));
 
-    // 阻止关键字 JSON（前端用）
-    $blockKw = json_encode(getBlockKeywords());
-    $blockHostKw = json_encode(getBlockHostKeywords());
-
-    $script = '<script>(function(){
-var pb=' . $proxyBaseJs . ',hs=' . $hostsJson . ',bk=' . $blockKw . ',bhk=' . $blockHostKw . ';
+    return '<script>(function(){
+var pb=' . $proxyBaseJs . ',hs=' . $hostsJson . ',ss=' . $segsJson . ',cs=' . $compJson . ',bhk=' . $blockHostKw . ';
+function esc(s){return s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
 function ok(u){try{var a=new URL(u);for(var i=0;i<hs.length;i++)if(a.hostname===hs[i]||a.hostname.endsWith("."+hs[i]))return true;}catch(e){}return false;}
-function wp(u){return typeof u==="string"&&u.indexOf(pb)!==0&&ok(u)?pb+"/"+u:u;}
-function isBlocked(u){if(typeof u!=="string")return false;var l=u.toLowerCase();for(var i=0;i<bhk.length;i++)if(l.indexOf(bhk[i])!==-1)return true;try{var a=new URL(u);var p=a.pathname.split("/");for(var j=0;j<p.length;j++){var s=p[j].toLowerCase();if(["login","signin","signup","join","register","session","authenticate","authorize","oauth","copilot","pricing","plans","checkout","billing"].indexOf(s)!==-1)return true;}}catch(e){}return false;}
-function nu(u){return isBlocked(u)?"about:blank":u;}
+function wp(u){return typeof u!=="string"||u.indexOf(pb)===0||!ok(u)?u:pb+"/"+u;}
+function isBlocked(u){
+if(typeof u!=="string")return false;var l=u.toLowerCase();
+for(var i=0;i<bhk.length;i++){if(new RegExp(esc(bhk[i])+"(?=[/?#]|$)").test(l))return true;}
+var p=l;try{p=new URL(l,location.href).pathname;}catch(e){p=l.split(/[?#]/)[0];}
+var seg=p.split("/");
+for(var j=0;j<seg.length;j++){var s=seg[j];
+if(ss.indexOf(s)!==-1)return true;
+for(var k=0;k<cs.length;k++){if(s.indexOf(cs[k]+"-")===0||s.indexOf(cs[k]+"_")===0)return true;}}
+return false;}
+function rt(u){return isBlocked(u)?"about:blank":wp(u);}
 document.addEventListener("DOMContentLoaded",function(){
 var ls=document.querySelectorAll("a[href]");
 for(var i=0;i<ls.length;i++){var h=ls[i].getAttribute("href");if(!h)continue;if(ok(h))ls[i].setAttribute("href",pb+"/"+h);if(isBlocked(h)){ls[i].setAttribute("href","about:blank");ls[i].setAttribute("onclick","return false;");ls[i].style.opacity="0.4";ls[i].style.pointerEvents="none";}}
 var fms=document.querySelectorAll("form[action]");for(var k=0;k<fms.length;k++){var a=fms[k].getAttribute("action");if(a&&isBlocked(a))fms[k].setAttribute("action","about:blank");}
 });
-var of=window.fetch;if(of)window.fetch=function(i,c){if(typeof i==="string")i=nu(i);else if(i&&i.url)i.url=nu(i.url);return of.call(this,i,c);};
-var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,a,b,c){return oo.call(this,m,nu(u),a,b,c);};
-var ows=window.WebSocket;if(ows)window.WebSocket=function(u,p){return new ows(wp(u),p);};
+var of=window.fetch;if(of)window.fetch=function(i,c){try{
+if(typeof i==="string")i=rt(i);
+else if(i&&i.url){var u=rt(i.url);if(u!==i.url&&typeof Request!=="undefined")i=new Request(u,i);}
+}catch(e){}return of.call(this,i,c);};
+var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,a,b,c){return oo.call(this,m,rt(u),a,b,c);};
+var ows=window.WebSocket;if(ows)window.WebSocket=function(u,p){if(isBlocked(u))throw new Error("blocked by proxy");return new ows(u,p);};
 document.addEventListener("submit",function(e){var f=e.target;if(f&&f.action&&ok(f.action))f.action=pb+"/"+f.action;if(f&&f.action&&isBlocked(f.action)){e.preventDefault();return false;}},true);
 window.addEventListener("beforeunload",function(e){if(isBlocked(location.href)){e.preventDefault();return false;}});
 })();</script>';
-
-    $pos = stripos($html, '</head>');
-    if ($pos !== false) return substr_replace($html, $script . '</head>', $pos, 7);
-
-    $pos = stripos($html, '<body');
-    if ($pos !== false) {
-        $gt = strpos($html, '>', $pos);
-        if ($gt !== false) return substr_replace($html, '>' . $script, $gt, 1);
-    }
-    return $script . $html;
 }
 
-/* ═════════════════════════════════════════════
- * 请求路由
- * ═════════════════════════════════════════════ */
+function injectIntoStream(string $html, string $proxyBase, bool $final): string {
+    if (!empty($GLOBALS['gInjected'])) return $html;
+
+    $script = getInjectScript($proxyBase);
+
+    if (preg_match('~<(head|body)(\s[^>]*)?>~i', $html, $m, PREG_OFFSET_CAPTURE)) {
+        $gt = strpos($html, '>', $m[0][1]);
+        if ($gt !== false) {
+            $GLOBALS['gInjected'] = 1;
+            return substr($html, 0, $gt + 1) . $script . substr($html, $gt + 1);
+        }
+    }
+
+    if ($final) {
+        $pos = strripos($html, '</html>');
+        if ($pos !== false) {
+            $GLOBALS['gInjected'] = 1;
+            return substr($html, 0, $pos) . $script . substr($html, $pos);
+        }
+        $GLOBALS['gInjected'] = 1;
+        return $script . $html;
+    }
+    return $html;
+}
+
+function injectProxyJs(string $html, string $proxyBase): string {
+    $GLOBALS['gInjected'] = false;
+    return injectIntoStream($html, $proxyBase, true);
+}
+
 
 function parseRequest(): array {
-    $uri = urldecode($_SERVER['REQUEST_URI'] ?? '/');
-    $q   = strpos($uri, '?');
-    if ($q !== false) $uri = substr($uri, 0, $q);
+    $raw = $_SERVER['REQUEST_URI'] ?? '/';
+
+    $q     = strpos($raw, '?');
+    $query = '';
+    if ($q !== false) {
+        $query = substr($raw, $q + 1);
+        $raw   = substr($raw, 0, $q);
+    }
+    $uri = rawurldecode($raw);
+
+    if ($query !== '') {
+        $parts = [];
+        foreach (explode('&', $query) as $kv) {
+            if ($kv === '' ) continue;
+            $k = explode('=', $kv, 2)[0];
+            if (strtolower(rawurldecode($k)) === 'token') continue;
+            $parts[] = $kv;
+        }
+        $query = implode('&', $parts);
+    }
 
     if (preg_match('#^/(https?://.+)$#i', $uri, $m)) {
-        return ['url' => $m[1], 'format' => 'full'];
+        return ['url' => $m[1] . ($query !== '' ? '?' . $query : ''), 'format' => 'full', 'query' => $query];
     }
     if (preg_match('#^/([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+(?:/.*)?)$#', $uri, $m)) {
-        return ['url' => 'https://github.com/' . $m[1], 'format' => 'short'];
+        return ['url' => 'https://github.com/' . $m[1] . ($query !== '' ? '?' . $query : ''), 'format' => 'short', 'query' => $query];
     }
-    return ['url' => '', 'format' => 'help'];
+    return ['url' => '', 'format' => 'help', 'query' => $query];
 }
 
-/* ═════════════════════════════════════════════
- * 核心: 执行代理请求
- * ═════════════════════════════════════════════ */
+function resolveLocation(string $value, string $origin): string {
+    $value = trim($value);
+    if ($value === '') return '';
+    if (preg_match('~^https?://~i', $value)) return $value;
+    if (strpos($value, '//') === 0) {
+        $scheme = parse_url($origin, PHP_URL_SCHEME) ?: 'https';
+        return $scheme . ':' . $value;
+    }
+    if ($origin === '') return $value;
+    return ($value[0] === '/') ? rtrim($origin, '/') . $value : rtrim($origin, '/') . '/' . $value;
+}
+
+function blockRedirectResponse(string $loc): void {
+    http_response_code(403);
+    header_remove('Location');
+    header('Content-Type: text/html; charset=utf-8');
+    $safeLoc = htmlspecialchars($loc, ENT_QUOTES, 'UTF-8');
+    echo <<<HTML
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>重定向被阻止</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.c{max-width:560px;width:100%;text-align:center}
+.icon{font-size:48px;margin-bottom:16px}
+h1{font-size:24px;color:#f85149;margin-bottom:12px}
+p{font-size:14px;color:#8b949e;line-height:1.7;margin-bottom:8px}
+.url{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin:16px 0;font-family:"SF Mono",Consolas,monospace;font-size:12px;color:#f0883e;word-break:break-all}
+a{color:#58a6ff;text-decoration:none}
+a:hover{text-decoration:underline}
+</style></head><body><div class="c">
+<div class="icon">🚫</div>
+<h1>重定向被阻止</h1>
+<p>该跳转指向登录/注册/Copilot 页面或代理白名单之外的主机，已被拦截。</p>
+<p class="url">{$safeLoc}</p>
+<p><a href="javascript:history.back()">← 返回上一页</a> | <a href="/">返回代理首页</a></p>
+</div></body></html>
+HTML;
+}
 
 function proxyRequest(string $url, string $proxyBase): void {
     dbg("→ $url");
@@ -505,21 +534,44 @@ function proxyRequest(string $url, string $proxyBase): void {
     $GLOBALS['gIsBinary']    = false;
     $GLOBALS['gHeadersSent'] = false;
     $GLOBALS['gProxyBase']   = $proxyBase;
+    $GLOBALS['gInjected']    = false;
+    $GLOBALS['gUpstreamCL']  = '';
+    $GLOBALS['gBlockedLoc']  = '';
+    $scheme = strtolower((string)(parse_url($url, PHP_URL_SCHEME) ?: 'https'));
+    $host   = strtolower((string)parse_url($url, PHP_URL_HOST));
+    $port   = (int)parse_url($url, PHP_URL_PORT);
+    $GLOBALS['gReqOrigin']   = $scheme . '://' . $host . ($port ? ':' . $port : '');
 
     $ch = curl_init($url);
 
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    $GLOBALS['gMethod'] = $method;
+
     $reqHeaders = [
-        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
-        'Cache-Control: no-cache',
+        'user-agent' => 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'accept' => 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'accept-language' => 'Accept-Language: en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+        'accept-encoding' => 'Accept-Encoding: identity',
+        'cache-control' => 'Cache-Control: no-cache',
+        'expect' => 'Expect:',   // 禁用 100-continue
     ];
-    if (!empty($_SERVER['HTTP_X_REQUESTED_WITH'])) {
-        $reqHeaders[] = 'X-Requested-With: ' . $_SERVER['HTTP_X_REQUESTED_WITH'];
+    $clientHdrs = [
+        'content-type'      => $_SERVER['CONTENT_TYPE'] ?? '',
+        'accept'            => $_SERVER['HTTP_ACCEPT'] ?? '',
+        'authorization'     => $_SERVER['HTTP_AUTHORIZATION'] ?? '',
+        'if-none-match'     => $_SERVER['HTTP_IF_NONE_MATCH'] ?? '',
+        'if-modified-since' => $_SERVER['HTTP_IF_MODIFIED_SINCE'] ?? '',
+        'x-requested-with'  => $_SERVER['HTTP_X_REQUESTED_WITH'] ?? '',
+    ];
+    foreach ($clientHdrs as $k => $v) {
+        $v = trim((string)$v);
+        if ($v === '') continue;
+        if ($k === 'accept' && $v === '*/*') continue;
+        $reqHeaders[$k] = ucwords($k, '-') . ': ' . $v;
     }
 
     curl_setopt_array($ch, [
-        CURLOPT_HTTPHEADER     => $reqHeaders,
+        CURLOPT_HTTPHEADER     => array_values($reqHeaders),
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_RETURNTRANSFER => false,
         CURLOPT_HEADERFUNCTION => function($ch, $line) use ($proxyBase) {
@@ -539,20 +591,32 @@ function proxyRequest(string $url, string $proxyBase): void {
 
             static $skipMap = null;
             if ($skipMap === null) $skipMap = array_flip([
-                'transfer-encoding', 'content-encoding', 'content-length',
-                'connection', 'keep-alive', 'strict-transport-security',
-                'content-security-policy', 'x-frame-options',
+                'transfer-encoding', 'content-encoding', 'connection', 'keep-alive',
+                'strict-transport-security', 'content-security-policy', 'x-frame-options',
                 'access-control-allow-origin', 'access-control-allow-credentials',
                 'set-cookie', 'vary',
             ]);
             if (isset($skipMap[$lower])) return strlen($line);
 
-            if ($lower === 'location' && shouldRewrite($value)) {
-                $value = makeProxyUrl($value, $proxyBase);
-            }
-            if ($lower === 'link') {
+            if ($lower === 'content-length') {
+                $GLOBALS['gUpstreamCL'] = $value;
+                if ($GLOBALS['gMethod'] !== 'HEAD') return strlen($line);
+            } elseif ($lower === 'location') {
+                $resolved = resolveLocation($value, $GLOBALS['gReqOrigin']);
+                if (isWhitelistedUrl($resolved)) {
+                    if (BLOCK_ENABLED && BLOCK_REDIRECTS && isBlockedUrl($resolved)) {
+                        $GLOBALS['gBlockedLoc'] = $resolved;      // 稍后 403
+                        return strlen($line);
+                    }
+                    $value = makeProxyUrl($resolved, $proxyBase);
+                } else {
+                    $GLOBALS['gBlockedLoc'] = $resolved;
+                    return strlen($line);
+                }
+            } elseif ($lower === 'link') {
                 $value = preg_replace_callback('#<(https?://[^>]+)>#',
-                    fn($m) => '<' . makeProxyUrl($m[1], $proxyBase) . '>', $value);
+                    fn($m) => shouldRewrite($m[1]) ? '<' . makeProxyUrl($m[1], $proxyBase) . '>' : $m[0],
+                    $value);
             }
 
             header($name . ': ' . $value, false);
@@ -563,7 +627,12 @@ function proxyRequest(string $url, string $proxyBase): void {
                 $ct = curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: 'text/html';
                 $GLOBALS['gContentType'] = $ct;
                 $GLOBALS['gIsBinary']    = isBinaryCT($ct);
-                if (!headers_sent()) header('Content-Type: ' . $ct, true);
+                if (!headers_sent()) {
+                    header('Content-Type: ' . $ct, true);
+                    if ($GLOBALS['gIsBinary'] && $GLOBALS['gUpstreamCL'] !== '') {
+                        header('Content-Length: ' . $GLOBALS['gUpstreamCL'], true);
+                    }
+                }
             }
 
             if ($GLOBALS['gIsBinary']) {
@@ -579,100 +648,52 @@ function proxyRequest(string $url, string $proxyBase): void {
 
             return strlen($data);
         },
-        CURLOPT_TIMEOUT         => 30,
+        CURLOPT_TIMEOUT         => 0,
         CURLOPT_CONNECTTIMEOUT  => 10,
+        CURLOPT_LOW_SPEED_LIMIT => 1,
+        CURLOPT_LOW_SPEED_TIME  => 30,
         CURLOPT_SSL_VERIFYPEER  => true,
         CURLOPT_SSL_VERIFYHOST  => 2,
         CURLOPT_PROTOCOLS       => CURLPROTO_HTTP | CURLPROTO_HTTPS,
         CURLOPT_REDIR_PROTOCOLS => 0,
     ]);
 
-    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-    if (!in_array($method, ['GET', 'HEAD'], true)) {
+    if ($method === 'HEAD') {
+        curl_setopt($ch, CURLOPT_NOBODY, true);
+    } elseif ($method !== 'GET') {
         $body = file_get_contents('php://input');
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
     }
 
     curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
-    // 重定向处理
-    if ($code >= 300 && $code < 400) {
-        $loc = curl_getinfo($ch, CURLINFO_REDIRECT_URL);
-        if ($loc) {
-            // ★ 阻止登录/注册/Copilot 重定向
-            if (BLOCK_REDIRECTS && isBlockedUrl($loc)) {
-                dbg("BLOCK redirect → $loc");
-                curl_close($ch);
-                http_response_code(403);
-                header('Content-Type: text/html; charset=utf-8');
-                $safeLoc = htmlspecialchars($loc, ENT_QUOTES, 'UTF-8');
-                echo <<<HTML
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>重定向被阻止</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.c{max-width:560px;width:100%;text-align:center}
-.icon{font-size:48px;margin-bottom:16px}
-h1{font-size:24px;color:#f85149;margin-bottom:12px}
-p{font-size:14px;color:#8b949e;line-height:1.7;margin-bottom:8px}
-.url{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin:16px 0;font-family:"SF Mono",Consolas,monospace;font-size:12px;color:#f0883e;word-break:break-all}
-a{color:#58a6ff;text-decoration:none}
-a:hover{text-decoration:underline}
-</style></head><body><div class="c">
-<div class="icon">🚫</div>
-<h1>重定向被阻止</h1>
-<p>GitHub 试图将你重定向到登录/注册/Copilot 页面，已被代理拦截。</p>
-<p class="url">{$safeLoc}</p>
-<p><a href="javascript:history.back()">← 返回上一页</a> | <a href="/">返回代理首页</a></p>
-</div></body></html>
-HTML;
-                return;
-            }
-
-            $locHost = parse_url($loc, PHP_URL_HOST) ?: '';
-            $locPath = parse_url($loc, PHP_URL_PATH) ?: '';
-            if (strpos($locHost, 'login') !== false ||
-                strpos($locPath, '/login') !== false ||
-                strpos($loc, 'authenticate') !== false) {
-                dbg("BLOCK login redirect → $loc");
-                curl_close($ch);
-                http_response_code(403);
-                header('Content-Type: application/json');
-                echo json_encode(['error' => 'GitHub redirected to login', 'location' => $loc]);
-                return;
-            }
-            if (shouldRewrite($loc)) {
-                $pu = makeProxyUrl($loc, $proxyBase);
-                dbg("REDIRECT $loc → $pu");
-                curl_close($ch);
-                http_response_code($code);
-                header('Location: ' . $pu);
-                return;
-            }
-        }
-    }
-
-    if (curl_errno($ch)) {
+    $errno = curl_errno($ch);
+    if ($errno) {
         $err = curl_error($ch);
         dbg("cURL error: $err");
         curl_close($ch);
-        if (!headers_sent()) { http_response_code(502); header('Content-Type: text/plain'); }
-        echo "Proxy Error: $err";
+        if (!headers_sent()) {
+            http_response_code(502);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "Proxy Error: $err";
+            return;
+        }
+        dbg("response truncated mid-body: $err");
         return;
     }
 
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    // ★ 关键: flush 剩余 buffer
+    if ($code >= 300 && $code < 400 && $GLOBALS['gBlockedLoc'] !== '') {
+        dbg("BLOCK redirect → {$GLOBALS['gBlockedLoc']}");
+        blockRedirectResponse($GLOBALS['gBlockedLoc']);
+        return;
+    }
+
     flushAllRemaining($GLOBALS['gContentType'], $proxyBase);
 }
-
-/* ═════════════════════════════════════════════
- * 帮助页面
- * ═════════════════════════════════════════════ */
 
 function helpPage(string $base): void {
     header('Content-Type: text/html; charset=utf-8');
@@ -708,16 +729,25 @@ h2{font-size:18px;margin:22px 0 10px;color:#f0f6fc}
 HTML;
 }
 
-/* ═════════════════════════════════════════════
- * 入口
- * ═════════════════════════════════════════════ */
-
 function main(): void {
+    header_remove('X-Powered-By');
+
     if (AUTH_ENABLED) {
-        $tok = $_GET['token'] ?? '';
-        if ($tok !== AUTH_TOKEN) {
+        $tok = (string)($_GET['token'] ?? '');
+        $fromQuery = $tok !== '';
+        if (!$fromQuery) $tok = (string)($_COOKIE['gp_token'] ?? '');
+
+        if ($tok === '' || !hash_equals(AUTH_TOKEN, $tok)) {
             http_response_code(401); header('Content-Type: text/plain; charset=utf-8');
             echo 'Unauthorized. 请添加 ?token=xxx 到 URL。'; return;
+        }
+        if ($fromQuery) {
+            setcookie('gp_token', $tok, [
+                'path'     => '/',
+                'httponly' => true,
+                'samesite' => 'Lax',
+                'secure'   => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'),
+            ]);
         }
     }
 
@@ -726,15 +756,17 @@ function main(): void {
 
     if ($parsed['format'] === 'help') { helpPage($base); return; }
 
-    // ★ 阻止 signin / signup / copilot 等 URL
-    if (BLOCK_ENABLED && isBlockedUrl($parsed['url'])) {
-        blockResponse($parsed['url'], 'blocked: signin/signup/copilot');
+    if (!isWhitelistedUrl($parsed['url'])) {
+        dbg("DENY non-whitelisted: {$parsed['url']}");
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "403 Forbidden: only whitelisted GitHub hosts can be proxied.\n";
         return;
     }
 
-    if (!filter_var($parsed['url'], FILTER_VALIDATE_URL)) {
-        http_response_code(400); header('Content-Type: text/plain');
-        echo 'Invalid URL: ' . $parsed['url']; return;
+    if (BLOCK_ENABLED && isBlockedUrl($parsed['url'])) {
+        blockResponse($parsed['url'], 'blocked: signin/signup/copilot');
+        return;
     }
 
     proxyRequest($parsed['url'], $base);
